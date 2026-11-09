@@ -7,7 +7,7 @@ Generates submission CSV deterministically from provided data.
 """
 
 """
-Ensure the correct Python version is used. The pipeline requires Python 3.9+ up till 3.12, 
+Ensure the correct Python version is used. The pipeline requires at least Python 3.9 and at most Python 3.12,
 and will exit with an error message if a different version is detected.
 """
 import sys
