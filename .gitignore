@@ -1,0 +1,58 @@
+# .gitignore for More than a Hack 2027
+
+# Match data (gated, not redistributable)
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Environments
+venv/
+ENV/
+env/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs and diagnostics
+logs/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Evaluation outputs (keep structure, not generated files)
+evaluation/results/*.csv
+evaluation/reports/*.txt
+evaluation/scoreboard.csv
+
+# Keep baseline results for reference
+!evaluation/results/baseline*.csv

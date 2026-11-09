@@ -1,0 +1,15 @@
+# Possession Labelling Pipeline - More than a Hack 2027
+# Pinned dependencies for reproducibility
+
+# Core
+numpy==1.26.4
+pandas==2.2.2
+
+# Tracking data loader
+kloppy==3.18.0
+
+# Scientific computing
+scipy==1.11.3
+
+# These are the only dependencies required to run the pipeline.
+# The evaluation (run_evaluation.py, validate_submission.py) needs only numpy and pandas.
