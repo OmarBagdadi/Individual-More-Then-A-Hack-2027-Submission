@@ -25,13 +25,21 @@ This document describes the technical approach, design decisions, and implementa
 Our system predicts frame-by-frame possession labels (H/A/D/X) from automatic tracking data using a modular, interpretable pipeline based on:
 
 1. **Ball trajectory reconstruction** with confidence estimates
-2. **Distance-weighted control evidence** from player positions
+2. **"On the ball" control evidence** from the closest player of each team, with Smart Tagging phases as a mild prior
 3. **Multi-signal dead ball detection**
 4. **Viterbi decoding** with possession structure constraints
 
 The approach prioritizes **possession structure** (spellF1 metric) over per-frame accuracy (macroF1), using high transition costs and minimum duration constraints to produce realistic possessions.
 
-**Result on public 5-minute window:** spellF1 **0.4706**, 17 possessions (matching ground truth count exactly), mean duration 17.1s.
+**Result on public 5-minute window:** spellF1 **0.5176**, macroF1 **0.8284**, 17 possessions (ground truth: 17), mean duration 15.1s (ground truth: 14.2s), home share of live time 52.4% (ground truth: 57.3%).
+
+**This number is a correctness check, not a ranking.** With 17 possessions, one possession moves spellF1 by about 6 points, and the scorer's bootstrap puts differences below ~0.37 inside the noise. On this window our spellF1 cannot be told apart from `baseline_smooth125` (0.4242). We do not know our full-match score.
+
+**Full-match plausibility (no answer key needed):** 228 possessions, mean 16.4s, median 9.7s, longest 94s; 99 stoppages, median 17.8s; ball in play 62 minutes (dead on 41.3% of graded frames); home share of live time 60.9% (64.2% / 57.3% by half).
+
+**External statistics were not used to build this.** After the first version we looked at public match statistics for this fixture (home team 65% possession, a pass-share figure). Because the rules exclude corrected possession data for the fixture, that number was never a target: no setting was chosen to approach it, and every change was justified by football reasoning and checked on quantities that need no answer key. It prompted us to look for errors; the errors found (crowd voting, voting around an unseen ball) are described in Stage 3.
+
+The history of changes since the first version, including a decoder bug that was found and fixed, is in [UPDATES.md](UPDATES.md).
 
 ---
 
@@ -82,8 +90,9 @@ We use the following from the provided data bundle:
 **Format:** SportsCode XML (638 tactical phases)
 
 - **What we use:**
-  - SET PIECES intervals (59 instances) → dead ball prior
+  - SET PIECES tags (59 instances) → each marks a restart; the 3.5 s before it are dead ball
   - Team tags → restart possession assignment
+  - Team tags of possession phases (BUILD UP, PROGRESSION, ATTACKING TRANSITION, LONG BALL, BALL IN FINAL THIRD) → mild possession prior
   - Kickoff events → time base verification
 
 - **Time base verified:** Seconds from video start × 25 = video frame (checked on both kickoffs)
@@ -232,39 +241,41 @@ Output: frame,label CSV (199,319 rows)
 
 **Problem:** Determine which team controls the ball at each frame.
 
-**Strategy: Distance-weighted voting**
+**Strategy: who is on the ball, and silence otherwise**
 
-For each frame with ball visible:
-1. For each player (slot `i`):
-   - Compute Euclidean distance to ball: `d = ||player_pos - ball_pos||`
-   - If `d ≤ max_distance` (10 m): vote with weight `exp(-d / tau)` where `tau = 3 m`
-2. Sum votes for home and away teams (using `team_of_track` mapping)
-3. Normalize: `home_score = home_vote / (home_vote + away_vote)`
+Three sources, strongest first:
 
-**Gating:**
-- If `ball_speed > 8.0 m/s` (fast pass/clearance): skip update, use previous frame's scores
-- If `ball_confidence < 0.3`: mark as `no_control` (contested)
-- If `max(home_score, away_score) < 0.6`: mark as `no_control` (no clear dominance)
+1. **On the ball.** Take the closest player of each team to the ball (`d_home`, `d_away`). The home score is `exp(-d_home/tau) / (exp(-d_home/tau) + exp(-d_away/tau))` with `tau = 1 m`: a player controls a ball within about a stride. Only the closest player per team counts, so three opponents pressing from 3 m do not outweigh the man on the ball.
+2. **No opinion (0.5 / 0.5)** when:
+   - nobody is within 2.5 m of the ball (loose, or in flight), or
+   - the ball has not been seen for a while (`ball_confidence < 0.3`): its position is frozen at the last sighting and players standing there say nothing about possession.
 
-**Smoothing:**
-- Gaussian filter (σ=2.0 frames) to reduce jitter
-- Re-normalize after smoothing
+   With no opinion, the decoder's transition cost keeps possession with the last team, as the challenge definition requires for loose and contested balls.
+3. **Smart Tagging phases, as a mild nudge.** During `BUILD UP`, `PROGRESSION`, `ATTACKING TRANSITION`, `LONG BALL` and `BALL IN FINAL THIRD` phases the tagged team gets a 60/40 opinion, added to the tracking opinion. Clear tracking evidence always outweighs it; it decides only where tracking is silent or balanced.
 
-**Why distance-weighted voting?**
-- Nearest-player-only (baseline) is too brittle - single tracking error flips possession
-- Exponential decay captures "zone of influence" around ball
-- Multiple nearby players from one team → stronger signal
-- Collective features robust to identity swaps
+**A touch is not control:** one frame's tracking opinion is capped at 0.85 / 0.15. With the transition cost of 40, about one second of clear control is needed for possession to change.
+
+**Ball in flight:** if `ball_speed > 8.0 m/s`, the opinion held just before the pass or shot is kept.
+
+**Smoothing:** Gaussian filter (σ=2.0 frames) on the tracking opinion.
+
+**Why not vote with every nearby player?** The first version did (all players within 10 m, 3 m decay). It systematically handed the ball to the pressing team, and in long ball gaps it kept counting players around a ball that was no longer there. On frames where one team is clearly on the ball and the other is over 4 m away, the home team has it 61.6% of the time; the first version's labels gave the home team 47.9% overall and 32.8% in long ball gaps.
+
+**Which Smart Tagging codes, and why:** chosen by what the code means, then checked on clear, ball-observed frames (no ground truth involved): the tagged team is the one on the ball in 90% of BUILD UP frames, 87% of PROGRESSION, 78% of LONG BALL, 73% of ATTACKING TRANSITION, 70% of BALL IN FINAL THIRD. `DEFENDING ...` and `DEFENSIVE TRANSITION` phases name the team *without* the ball (10-27%) and mirror an attacking phase over the same interval, so using them would count the same thing twice. Box and chance phases (55-61%) are not used.
 
 **Output:**
-- `evidence['home_score']`: Array of home control probabilities (0-1)
-- `evidence['away_score']`: Array of away control probabilities (0-1)  
-- `evidence['no_control']`: Boolean array, True when contested/unclear
+- `evidence['home_score']`: home control score (0-1), 0.5 = no opinion
+- `evidence['away_score']`: `1 - home_score`
+- `evidence['no_control']`: True where tracking has no opinion (diagnostic only)
 
 **Stats (full match):**
-- Clear control: 199,319 frames (100% after gating handled)
-- Home dominant: 99,187 frames (49.8%)
-- Away dominant: 100,132 frames (50.2%)
+- Tracking has an opinion: 59,980 frames (30.1%)
+- Ball loose / nobody within 2.5 m: 55,539 frames
+- Ball not seen recently: 83,800 frames
+- Home on the ball: 49,626 frames; away on the ball: 34,758 frames
+- Smart Tagging phase opinion: home 56,217 frames, away 30,698 frames
+
+Tracking speaks on only 30% of frames. Everything else is carried by the decoder's stickiness and the Smart Tagging phases.
 
 ---
 
@@ -272,43 +283,46 @@ For each frame with ball visible:
 
 **Problem:** Identify frames where ball is out of play.
 
-**Multi-signal fusion:**
+**Signals, each with a football meaning:**
 
-1. **Out of bounds** (hard signal):
-   - Ball outside pitch ± 2m margin → `prob = 1.0`
+1. **What the players are doing** (main signal):
+   - Mean speed of the tracked players, smoothed over about a second
+   - A soft step around 1.5 m/s turns it into "walking" (1) or "playing" (0)
+   - Frames with fewer than 8 tracked players keep the last reliable value
 
-2. **Ball stationary** (medium signal):
-   - `ball_speed < 0.3 m/s` → `prob = 0.6`
+2. **Whether the ball is seen**, combined with the players:
 
-3. **Collective player speed drop** (weak signal):
-   - Mean player speed across all slots < 1.5 m/s → `prob = 0.4`
-   - Indicates stoppage (players standing/walking)
+   | | ball not seen | ball seen |
+   |---|---|---|
+   | players walking | `prob = 0.9` | `prob = 0.6` |
+   | players playing | `prob = 0.1` | `prob = 0.05` |
 
-4. **Smart Tagging SET PIECES prior** (strong signal):
-   - Frame inside SET PIECES interval → `prob = 0.7`
+   - Walking with the ball lost by the tracking is a stoppage almost every time (the ball is in someone's hands or off the pitch)
+   - Walking with the ball in view also happens in slow build-up, so it takes several seconds of it to call a stoppage
 
-5. **Restart detection** (inverse signal):
-   - Ball + players accelerate suddenly → `prob = 0.2` for next 3 seconds
-   - Marks end of dead period
+3. **Out of bounds** (rule of the game):
+   - Ball observed outside pitch ± 2m margin → `prob = 1.0`
 
-**Combination:** Element-wise maximum (conservative - any strong signal dominates)
+4. **Smart Tagging SET PIECES** (rule of the game):
+   - The tag is a fixed window around a restart, not the stoppage: 35 s for throw-ins, corners, goal kicks and free kicks, 5 s for kick-offs. It starts a few seconds before the ball is put back in play and runs on through the live play after it
+   - Only the first 3.5 s (the lead-in before the restart) are dead ball → `prob = 0.95`
+   - The 3.5 s comes from the two kick-off tags, which start 82 and 90 frames before the kick-off anchors in `games.py`
 
 **Smoothing:** Gaussian filter (σ=3.0 frames) to prevent rapid D↔H/A flicker
 
 **Output:**
 - `dead_prob`: Array of dead ball probabilities (0-1)
 
-**Stats (full match):**
-- Likely dead (prob > 0.5): 110,004 frames (55.2%)
-- Out of bounds: 20,307 frames
-- Ball stationary: 88,391 frames
-- Low collective activity: 112,558 frames
-- SET PIECES intervals: 44,037 frames
+**Stats (full match, all 199,319 frames):**
+- Likely dead (prob > 0.5): 106,774 frames (53.6%)
+- Players walking, ball unseen: 71,532 frames
+- Players walking, ball seen: 41,816 frames
+- Ball seen out of bounds: 2,760 frames
+- SET PIECES lead-in: 5,133 frames
 
-**Limitation:** Dead ball F1 is weak (0.06 on public window). System over-predicts live play. This is partially intentional:
-- False negative on D (label as H/A) → possession continues, low spellF1 cost
-- False positive on D (label as D) → possession splits, high spellF1 cost
-- Optimizing for spellF1, not macroF1
+**What was removed (UPDATES.md, entries 23-25):** treating the whole 35 s tag as dead ball (most of it is live play), the "stationary ball" signal (a ball seen standing still was dead no more often than any other), the restart-acceleration signal, and the `DEAD_BALL_BIAS` constant in the decoder.
+
+**Limitation:** On the public window dead-ball F1 is 0.79 (precision 0.92, recall 0.69). Players keep running for two or three seconds after the ball goes out, so stoppages are found a little late, and a quick restart with nobody walking is not found at all.
 
 ---
 
@@ -322,19 +336,24 @@ States: `H` (home possession), `A` (away possession), `D` (dead ball)
 
 **Emission costs:**
 ```python
-emission[i, H] = -log(home_score[i]) - log(1 - dead_prob[i])
-emission[i, A] = -log(away_score[i]) - log(1 - dead_prob[i])
+emission[i, H] = -log(2 * home_score[i]) - log(1 - dead_prob[i])
+emission[i, A] = -log(2 * away_score[i]) - log(1 - dead_prob[i])
 emission[i, D] = -log(dead_prob[i])
 ```
 (Negative log probabilities = costs to minimize)
 
+- Control is measured relative to "no opinion" (`2 * 0.5 = 1`, cost 0), so who has the ball and whether it is in play are separate questions.
+- There is no extra constant for dead against live: the probabilities from Stage 4 are used as they are.
+
 **Transition costs:**
 ```
        to H    to A    to D
-from H: 0.0    40.0    5.0
-from A: 40.0   0.0     5.0
-from D: 5.0    5.0     0.0
+from H: 0.0    40.0    40.0
+from A: 40.0   0.0     40.0
+from D: 40.0   40.0    0.0
 ```
+
+Every change of state costs the same. A stoppage therefore needs sustained evidence, exactly like a change of team. (The first version used 5.0 for live↔dead; once the emission bug described in UPDATES.md was fixed, that produced about 220 stoppages, roughly twice what a match has.)
 
 **Key design: High H↔A cost (40.0) = hysteresis**
 - Requires sustained opposing control for ~1-2 seconds before switching teams
@@ -349,20 +368,29 @@ from D: 5.0    5.0     0.0
 
 1. **Min-duration constraints:**
    - Possessions (H/A runs) < 1.5 s (38 frames) absorbed into neighbors
-   - Dead stretches < 0.5 s (13 frames) absorbed into neighbors
-   - Prevents unrealistic micro-possessions
+   - Dead stretches < 2 s (50 frames) absorbed into neighbors
+   - Prevents unrealistic micro-possessions and micro-stoppages
 
 2. **Hysteresis enforcement:**
    - For each H→A transition, check if away_score > home_score for next 1.0 s
    - If not sustained, revert to H
    - (Similarly for A→H)
 
-3. **Restart logic:**
+3. **Change-overs centred in silent stretches:**
+   - If a change of team falls in a stretch where tracking has no opinion (ball loose, in the air or unseen) and Smart Tagging does not change its mind, every frame of the stretch scores the same and the Viterbi pass picks by the order of its states
+   - That order gave the whole stretch to the home team in both directions; the change is now placed in the middle of the stretch (23 change-overs moved, home-to-away 1.1 s earlier and away-to-home 0.5 s later on average)
+
+4. **Restart logic:**
    - After each D stretch, check Smart Tagging Team tag for SET PIECES interval
    - If known, assign next ~2 seconds to that team
    - Handles kickoffs, goal kicks, corners (but not throw-ins tagged N/A)
 
-4. **X label assignment:**
+4. **Pre-kick-off rule:**
+   - Graded frames before a half's kick-off → `D`
+   - For this match the second half is graded from frame 110,808 but kicks off at 113,742 (FAQ.md); those 2,934 frames are dead ball
+   - Kick-off positions are the video anchors published in `games.py`
+
+5. **X label assignment:**
    - Frames outside graded regions → `X`
    - Optionally: Low-confidence ball within possession → `X` (forward-fill in scorer)
    - We set `USE_X_FOR_OCCLUSIONS = False` (prefer H/A over X within possessions)
@@ -371,12 +399,12 @@ from D: 5.0    5.0     0.0
 - `labels`: Array of strings {'H', 'A', 'D', 'X'} length 199,319
 
 **Stats (full match):**
-- H: 70,869 frames (35.6%)
-- A: 69,562 frames (34.9%)
-- D: 18,426 frames (9.2%)
+- H: 56,766 frames (28.5%)
+- A: 36,464 frames (18.3%)
+- D: 65,627 frames (32.9%; 41.3% of graded frames)
 - X: 40,462 frames (20.3%)
-- Total possessions: 410 (on full match)
-- Mean possession duration: 13.7 s
+- Total possessions: 228 (on full match)
+- Mean possession duration: 16.4 s
 
 ---
 
@@ -386,12 +414,12 @@ from D: 5.0    5.0     0.0
 
 **Metrics computed:**
 
-1. **Team agreement:** On frames with Smart Tagging Team tag (H/A), what % match our label?
-   - Result: 33.1% on full match
-   - Low because Smart Tagging phases ≠ possessions, and it's inferred
+1. **Team agreement:** On frames inside a Smart Tagging possession phase (the codes used in Stage 3) that we label live, what % carry the tagged team?
+   - Result: 90.4% on full match
+   - Partly circular, because those phases feed the labels. A gross-error check only.
 
 2. **Dead agreement:** On SET PIECES intervals, what % of our labels are D?
-   - Result: 99.8% (very high - we over-predict dead ball)
+   - Result: 30.8%. This is expected to be low: a SET PIECES tag is a 35 s window of which only the first few seconds are a stoppage. The number is logged but no longer means "agreement"
 
 3. **Possession count and duration distribution:**
    - Used to catch gross errors (e.g., 10,000 possessions = clearly wrong)
@@ -407,28 +435,32 @@ Our implementation follows these rules, derived from the challenge definition an
 ### Change of Possession
 
 A possession change occurs when:
-1. **Sustained control by opposing team:** Opposing control scores higher for ≥1.0 second (hysteresis)
+1. **Sustained control by opposing team:** an opposing player is on the ball (closest player, within about a stride) for roughly a second, and the previous team does not clearly have it back within the next second (hysteresis)
 2. **After dead ball:** Possession assigned based on restarting team (Smart Tagging)
+3. **While the ball is unseen:** only if a Smart Tagging possession phase for the other team persists for several seconds
 
 ### What is NOT a change of possession
 
-- Single touch without control (deflection, rebound)
+- Single touch without control (deflection, rebound): one frame's evidence is capped
+- Opponents pressing near the ball: only the closest player of each team is compared
 - Ball in flight during pass (high speed, no control update)
-- Contested/loose ball (under dominance threshold) - stays with last team
+- Loose ball (nobody within 2.5 m) - stays with last team
+- Ball lost by the tracking - stays with last team
 
 ### Dead Ball
 
 Ball is dead when:
 - Out of bounds (outside pitch ± 2m)
-- Stationary + low collective activity
-- Inside SET PIECES interval (Smart Tagging prior)
+- The players are collectively walking (strongly if the ball is not seen, mildly if it is)
+- In the 3.5 s before a restart tagged by Smart Tagging (SET PIECES)
+- Before the kick-off of a half
 
 **After dead ball ends:** Next possession assigned to restart team (if known from Smart Tagging), else inferred spatially or from previous possession.
 
 ### Minimum Durations
 
 - **Possession:** 1.5 seconds (realism constraint)
-- **Dead ball:** 0.5 seconds (prevent flicker)
+- **Dead ball:** 2 seconds (no real restart is quicker)
 
 Shorter runs absorbed into neighbors during post-processing.
 
@@ -438,7 +470,7 @@ Shorter runs absorbed into neighbors during post-processing.
 
 ### Language and Libraries
 
-- **Python 3.9+** (tested on 3.9, 3.11, 3.13)
+- **Python 3.9 to 3.12** (`run.py` refuses newer versions; verified on 3.12)
 - **numpy 1.26.4:** Array operations, Viterbi DP
 - **pandas 2.2.2:** DataFrame handling (kloppy output)
 - **kloppy 3.18.0:** ATD loader (pinned - known to work with Metrica EPTS export)
@@ -453,9 +485,8 @@ Shorter runs absorbed into neighbors during post-processing.
 
 ### Performance
 
-- **Runtime:** ~2 minutes on modern hardware (tested on Intel i7, 16GB RAM)
-- **Memory:** Peak ~2GB (dominated by kloppy DataFrame loading)
-- **Bottleneck:** ATD loading via kloppy (parses 199,319 records × 46 slots)
+- **Runtime:** two to three minutes (measured 132 to 181 s on a Windows 11 laptop)
+- **Bottleneck:** ATD loading via kloppy
 
 **Optimization opportunities (not pursued):**
 - Parse ATD directly (skip kloppy DataFrame conversion)
@@ -466,7 +497,7 @@ Shorter runs absorbed into neighbors during post-processing.
 
 ## Hyperparameters
 
-All parameters in `src/possession/config.py`. **Chosen from domain knowledge, not tuned on public GT** (17 possessions too small for reliable tuning).
+All parameters in `src/possession/config.py`. **Chosen from football knowledge and the plausibility of the full-match output, not by optimising the public score** (17 possessions too small for reliable tuning). The public window's descriptive statistics (mean possession 14.2 s) were used as a reference for what a plausible output looks like.
 
 ### Ball Reconstruction
 
@@ -480,52 +511,59 @@ BALL_UNCERTAINTY_GROWTH_RATE = 0.1  # Exponential decay per frame
 ### Control Evidence
 
 ```python
-CONTROL_DISTANCE_TAU = 3.0          # metres - zone of influence decay
-CONTROL_MAX_DISTANCE = 10.0         # metres - beyond this, no vote
-NO_CONTROL_THRESHOLD = 0.6          # require 60% dominance for clear control
+CONTROL_RADIUS_TAU = 1.0            # metres - a player controls a ball within about a stride
+LOOSE_BALL_DISTANCE = 2.5           # metres - nobody this close: loose ball, no opinion
+CONTROL_SCORE_CAP = 0.85            # a touch is not control: ~1 s of clear control to switch
+BALL_CONFIDENCE_MIN = 0.3           # ball unseen for a while: no opinion
 BALL_FLIGHT_SPEED_THRESHOLD = 8.0   # m/s (~29 km/h) - typical pass speed
+POSSESSION_PHASE_CODES = [BUILD UP, PROGRESSION, ATTACKING TRANSITION, LONG BALL, BALL IN FINAL THIRD]
+PHASE_PRIOR = 0.6                   # Smart Tagging opinion: 60/40
 ```
 
 **Rationale:**
-- 3m decay: Based on typical player control radius (~1-2m at 1σ)
-- 10m cutoff: Balance between local control and computational cost
-- 60% threshold: Require clear dominance, not just slight edge
-- 8 m/s: Measured pass speed from tracking data (mean ~5 m/s, 90th percentile ~10 m/s)
+- 1 m radius, 2.5 m loose-ball distance: football judgement about what "on the ball" means, fixed before looking at any result
+- 0.85 cap: derived from the transition cost so that a clean change of possession takes about a second (`40 / log(0.85/0.15) ≈ 23` frames)
+- 0.6 phase prior: mild by design; at 0.6 a phase needs about 4 seconds of tracking silence to change the owner (`40 / log(0.6/0.4) ≈ 99` frames)
+- 8 m/s: pass speed, unchanged from the first version
+- None of these was swept against a score
 
 ### Dead Ball Detection
 
 ```python
-BALL_STATIONARY_SPEED = 0.3         # m/s - walking pace
-COLLECTIVE_SPEED_DROP = 1.5         # m/s - mean player speed during stoppage
+COLLECTIVE_SPEED_DROP = 1.5         # m/s - players walking below, playing above
+COLLECTIVE_SPEED_WIDTH = 0.1        # m/s - softness of that step
+DEAD_PROB_WALKING_BALL_UNSEEN = 0.9 # players walking, ball lost: almost always a stoppage
+DEAD_PROB_WALKING_BALL_SEEN = 0.6   # players walking, ball in view: more often than not
+DEAD_PROB_ACTIVE_BALL_UNSEEN = 0.1  # players running: play is on
+DEAD_PROB_ACTIVE_BALL_SEEN = 0.05
 OUT_OF_BOUNDS_MARGIN = 2.0          # metres - generous margin for tracking noise
-SET_PIECES_PRIOR_WEIGHT = 0.7       # Trust Smart Tagging moderately
+SET_PIECE_LEAD_IN_FRAMES = 87       # 3.5 s before a tagged restart
+SET_PIECE_LEAD_IN_PROB = 0.95       # the ball is dead just before a restart
 ```
 
 **Rationale:**
-- Speed thresholds from histogram analysis of tracking data
+- The probabilities are rounded football judgements, not fitted values. Moving each of them (0.5-0.7 for walking/seen, 0.8-0.95 for walking/unseen, the step at 1.4-1.6 m/s) keeps the full match between 89 and 101 stoppages and 59 to 65 minutes of ball in play
 - 2m margin accounts for tracking jitter near boundaries
-- 0.7 prior: Trust Smart Tagging but allow override by stronger signals
+- The 3.5 s lead-in is measured on the two kick-off tags against the kick-off anchors in `games.py`
 
 ### Viterbi Decoding
 
 ```python
 TRANSITION_COST_H_A = 40.0          # High cost = sticky possessions
-TRANSITION_COST_LIVE_TO_DEAD = 5.0  # Moderate cost
-TRANSITION_COST_DEAD_TO_LIVE = 5.0  # Moderate cost
-MIN_POSSESSION_FRAMES = 38          # ~1.5 seconds
-MIN_DEAD_FRAMES = 13                # ~0.5 seconds
+TRANSITION_COST_LIVE_TO_DEAD = 40.0 # Same as H<->A
+TRANSITION_COST_DEAD_TO_LIVE = 40.0 # Same as H<->A
+MIN_POSSESSION_FRAMES = 37          # ~1.5 seconds
+MIN_DEAD_FRAMES = 50                # 2 seconds
 HYSTERESIS_FRAMES = 25              # ~1.0 second sustained control required
 ```
 
 **Rationale:**
-- H↔A cost 40.0: Tuned on qualitative review of decoded sequences (prevents flicker while allowing real changes)
-- Min durations: Informed by public GT statistics (mean possession 14.2s, shortest ~3s)
+- H↔A cost 40.0: Chosen by reviewing decoded sequences (prevents flicker while allowing real changes)
+- Live↔dead cost 40.0: Set equal to the H↔A cost. Compared against 5, 10 and 20 on answer-key-free checks only; 40 is the only value giving a realistic number of stoppages (about 110; a match has roughly 100-130 restarts). Full table in UPDATES.md.
+- Min durations: Possession informed by public GT statistics (mean possession 14.2s, shortest ~3s); stoppage from the fact that no restart takes under 2 s
 - Hysteresis: Matches challenge definition of "sustained control"
 
-**Parameter sensitivity:**
-- TRANSITION_COST_H_A has widest plateau: 30-50 all produce similar spellF1
-- MIN_POSSESSION_FRAMES: 25-50 frames (~1-2s) all reasonable
-- Other parameters less critical
+**Parameter sensitivity:** not measured against a ground truth, because the public window is too small to do so reliably. The live↔dead cost is sensitive in terms of output shape (see the table in UPDATES.md).
 
 ---
 
@@ -533,31 +571,38 @@ HYSTERESIS_FRAMES = 25              # ~1.0 second sustained control required
 
 ### Current Limitations
 
-1. **Dead ball detection is weak:**
-   - D class F1: 0.06 (precision 0.22, recall 0.03)
-   - Over-predicts live play
-   - Root cause: SET PIECES prior not strong enough, other signals too noisy
-   - **Mitigation:** Optimizing for spellF1, not macroF1 - D errors less costly if possession structure preserved
+1. **Dead ball detection is approximate:**
+   - D class F1 on the public window: 0.79 (precision 0.92, recall 0.69)
+   - Stoppages start late: players keep running for two or three seconds after the ball goes out. Quick restarts where nobody walks are missed
+   - The full match now has 62 minutes of ball in play, which is at the high end for a football match; some stoppages are probably still missed
+   - When the ball is unseen, only player activity and Smart Tagging are left
+   - A ball last seen out of bounds stays "out" until the tracking finds it again, which can run past the restart
+   - On the public window we predict 17 possessions against 17 true ones, but find only 5 of 20 change-overs within a second: the right number of possessions with imprecise boundaries. Our misses are early as often as late, two true possessions last under 1.5 s, and in two cases the tracking shows the previous team still on the ball for seconds after the true change (see UPDATES.md, entry 19)
 
-2. **No player identities:**
+2. **We are blind for most of the match:**
+   - Tracking has an opinion about who is on the ball in only 30% of frames; the ball is unseen in long gaps for 43%
+   - In those stretches possession is held with the last team and can change only through a Smart Tagging phase or a stoppage, so real changes of possession during ball gaps are found late or missed
+   - **What we would fix first:** estimate the ball's whereabouts during gaps from how the players move (both teams shift towards the ball), instead of staying silent
+
+3. **No player identities:**
    - Cannot follow individual players through identity swaps
    - Limits ability to use player-specific models (e.g., "player X is a defender, less likely to score")
    - **Mitigation:** Use collective team features only
 
-3. **Restart assignment imperfect:**
+4. **Restart assignment imperfect:**
    - Smart Tagging Team = N/A for throw-ins (36 instances)
    - Fallback spatial heuristics (nearest touchline) unreliable
    - **Mitigation:** Short duration, limited impact on overall spellF1
 
-4. **No video features:**
+5. **No video features:**
    - Referee signals (whistle, hand gestures) would improve dead ball detection
    - Player jersey numbers for identity
    - **Mitigation:** Tracking + Smart Tagging sufficient for first approach
 
-5. **Hyperparameter interactions:**
+6. **Hyperparameters are not validated against a ground truth:**
    - Transition costs, min-durations, and smoothing sigma interact non-linearly
    - Exhaustive grid search infeasible on 17-possession public GT
-   - **Mitigation:** Wide plateaus chosen, robust to ±20% parameter variation
+   - **Mitigation:** values chosen for football plausibility of the full-match output; their robustness has not been measured
 
 ### Future Work
 
@@ -614,7 +659,7 @@ To reproduce `evaluation/results/submission.csv` byte-for-byte:
    ```bash
    python run.py
    ```
-   - Expected runtime: ~2 minutes
+   - Expected runtime: two to three minutes
    - Output: `evaluation/results/submission.csv`
    - Logs: `logs/diag.txt`
 
@@ -627,7 +672,7 @@ To reproduce `evaluation/results/submission.csv` byte-for-byte:
 5. **Score:**
    ```bash
    python evaluation/run_evaluation.py
-   # Should rank submission #1 with spellF1 0.4706 on public window
+   # Should show submission with spellF1 0.5176 and macroF1 0.8284 on the public window
    ```
 
 ### Determinism Guarantees
@@ -638,10 +683,7 @@ To reproduce `evaluation/results/submission.csv` byte-for-byte:
 - **No external API calls:** All computation local
 - **No file ordering dependencies:** Loads single match only
 
-**Platform differences:**
-- Float precision may vary slightly across architectures (x86 vs ARM)
-- Expected: Last decimal place difference in probabilities, no label changes
-- Tested on: Windows 11 (x64), Ubuntu 22.04 (x64), macOS 14 (ARM64)
+**Verified:** two consecutive runs on Windows 11 (x64), Python 3.12, produce byte-identical files (SHA-256 `9f8f9abd80ac860a...`). Other platforms have not been tested; float rounding could in principle differ across architectures.
 
 ---
 
@@ -653,6 +695,6 @@ To reproduce `evaluation/results/submission.csv` byte-for-byte:
 
 ---
 
-**Document version:** 1.0  
-**Date:** November 5, 2026  
+**Document version:** 1.2  
+**Date:** November 12, 2026  
 **Competition deadline:** November 17, 2026

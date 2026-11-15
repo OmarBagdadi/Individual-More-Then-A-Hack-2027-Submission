@@ -55,19 +55,20 @@ def viterbi_decode(evidence, dead_prob, ball_state, events, graded_mask):
     H, A, D = 0, 1, 2
     n_states = 3
 
-    # Emission log-probabilities (negative = cost)
-    # Higher score = lower cost
+    # Emission log-probabilities (higher = more likely; the forward pass maximises).
     emission = np.zeros((n_frames, n_states))
 
-    for i in range(n_frames):
-        # Home state: cost inversely proportional to home score
-        emission[i, H] = -(-np.log(home_score[i] + 1e-6) + np.log(1 - dead_prob[i] + 1e-6))
+    # Live-play term shared by H and A: log P(ball is alive).
+    log_alive = np.log(1 - dead_prob + 1e-6)
 
-        # Away state: cost inversely proportional to away score
-        emission[i, A] = -(-np.log(away_score[i] + 1e-6) + np.log(1 - dead_prob[i] + 1e-6))
+    # Home / away: the ball must be alive, plus the control evidence measured relative to
+    # "no opinion" (score 0.5 -> 0). Who has the ball and whether it is in play are separate
+    # questions: a frame with no control evidence must not look more dead than one with.
+    emission[:, H] = np.log(2 * home_score + 1e-6) + log_alive
+    emission[:, A] = np.log(2 * away_score + 1e-6) + log_alive
 
-        # Dead state: cost inversely proportional to dead probability
-        emission[i, D] = -(-np.log(dead_prob[i] + 1e-6))
+    # Dead state: log P(ball is dead).
+    emission[:, D] = np.log(dead_prob + 1e-6)
 
     # Transition costs
     transition = np.array([
@@ -107,8 +108,15 @@ def viterbi_decode(evidence, dead_prob, ball_state, events, graded_mask):
     # Apply hysteresis for H<->A transitions
     path = apply_hysteresis(path, HYSTERESIS_FRAMES, home_score, away_score)
 
+    # A change of team decided inside a stretch with no evidence goes in the middle of it.
+    path = center_changeovers(path, evidence['track_silent'], evidence['prior_sign'])
+
     # Use Smart Tagging to inform restart possessions
     path = apply_restart_logic(path, events)
+
+    # The ball is dead from the start of each graded half until that half's kick-off.
+    for half_start, kickoff in pre_kickoff_blocks():
+        path[half_start:kickoff] = D
 
     # Convert to labels
     label_map = {H: 'H', A: 'A', D: 'D'}
@@ -144,6 +152,35 @@ def viterbi_decode(evidence, dead_prob, ball_state, events, graded_mask):
     log(f"  Mean possession duration: {(n_h + n_a) / (possessions + 1e-6) / FPS:.1f} s")
 
     return labels
+
+
+""" Frames between the start of each graded half and its kick-off.
+
+    The graded region of a half can begin before the ball is kicked off (for this match the
+    second half is graded from frame 110,808 but kicks off at 113,742, see FAQ.md). Play has
+    not started, so those frames are dead ball. The kick-off positions are the video anchors
+    published in games.py (minute, second, frame-within-second of the tactical video).
+
+    Returns:
+        list of (half_start_frame, kickoff_frame); kickoff_frame is exclusive
+"""
+def pre_kickoff_blocks():
+    from games import GAMES, GAME, half_video_blocks
+
+    game = GAMES[GAME]
+    anchors = {1: game.get('kickoff'), 2: game.get('kickoff_2nd')}
+
+    blocks = []
+    for half, start_frame, end_frame in half_video_blocks(GAME):
+        anchor = anchors.get(half)
+        if anchor is None:
+            continue
+        # +1: the anchor is the last frame before the ball is in play
+        kickoff = (anchor['minute'] * 60 + anchor['second']) * FPS + anchor['frame'] + 1
+        if start_frame < kickoff <= end_frame:
+            blocks.append((start_frame, kickoff))
+
+    return blocks
 
 
 """ Absorb runs shorter than min_frames into neighbors.
@@ -209,15 +246,73 @@ def apply_hysteresis(path, hysteresis_frames, home_score, away_score):
         if path[i-1] == H and path[i] == A:
             # Switching from H to A, check if A dominant for next hysteresis_frames
             window = slice(i, min(i + hysteresis_frames, n))
-            if not (away_score[window] > home_score[window]).all():
+            if not (away_score[window] >= home_score[window]).all():
                 # Not sustained, revert to H
                 path[i] = H
         elif path[i-1] == A and path[i] == H:
             # Switching from A to H
             window = slice(i, min(i + hysteresis_frames, n))
-            if not (home_score[window] > away_score[window]).all():
+            if not (home_score[window] >= away_score[window]).all():
                 # Not sustained, revert to A
                 path[i] = A
+
+    return path
+
+
+""" Place a change of team in the middle of the silent stretch it falls in.
+
+    When one team is on the ball, then nobody is (ball loose, in the air or unseen), then the
+    other team is, the evidence does not say when inside that stretch the ball changed hands:
+    every frame of it scores the same. The Viterbi pass then picks by the order of its states,
+    which put home-to-away changes at the end of the stretch and away-to-home changes at the
+    start, giving the whole stretch to the home team either way. The middle treats both teams
+    alike and halves the worst-case timing error.
+
+    A stretch only counts while the Smart Tagging opinion is constant across it; where Smart
+    Tagging changes its mind inside the stretch the decoder has already used that.
+
+    Args:
+        path: array of state indices
+        track_silent: boolean array, True where tracking has no opinion
+        prior_sign: Smart Tagging phase opinion per frame
+
+    Returns:
+        modified path
+"""
+def center_changeovers(path, track_silent, prior_sign):
+    path = path.copy()
+    n = len(path)
+    H, A, D = 0, 1, 2
+
+    live_change = (path[1:] != path[:-1]) & (path[1:] != D) & (path[:-1] != D)
+    shifts = {(H, A): [], (A, H): []}
+
+    for i in np.flatnonzero(live_change) + 1:
+        old, new = path[i - 1], path[i]
+        if not (track_silent[i] or track_silent[i - 1]):
+            continue
+        if prior_sign[i - 1] != prior_sign[i]:
+            continue
+
+        start = i
+        while (start > 0 and track_silent[start - 1] and path[start - 1] == old
+               and prior_sign[start - 1] == prior_sign[i - 1]):
+            start -= 1
+        end = i
+        while (end < n and track_silent[end] and path[end] == new
+               and prior_sign[end] == prior_sign[i]):
+            end += 1
+
+        middle = (start + end) // 2
+        path[start:middle] = old
+        path[middle:end] = new
+        shifts[(old, new)].append(middle - i)
+
+    log("\nChange-overs centred in silent stretches:")
+    for (old, new), name in (((H, A), 'home to away'), ((A, H), 'away to home')):
+        moved = np.array(shifts[(old, new)])
+        if len(moved):
+            log(f"  {name}: {len(moved)} moved, mean shift {moved.mean() / FPS:+.2f} s")
 
     return path
 

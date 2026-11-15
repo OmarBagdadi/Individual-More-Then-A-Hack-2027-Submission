@@ -1,19 +1,33 @@
-"""Dead ball detection: identify stoppages using multiple signals.
+"""Dead ball detection: per-frame probability that play has stopped.
 
-Combines ball out of bounds, stationary, collective player speed, Smart Tagging SET PIECES.
+Three signals, each with a football meaning:
+
+1. What the players are doing. When play stops the players walk; while the ball is in play
+   they run. The collective speed of the tracked players is the main signal.
+2. Whether the ball is seen. Players walking while the tracking has lost the ball is a
+   stoppage almost every time (the ball is in someone's hands or off the pitch). Players
+   walking with the ball in view is weaker: it also happens in slow build-up play.
+3. The rules. A ball seen beyond the lines is out. And a Smart Tagging SET PIECES tag marks a
+   restart, so the ball was dead in the seconds just before it.
 """
 
 import numpy as np
+import pandas as pd
 from scipy.ndimage import gaussian_filter1d
 from src.possession.config import (
-    BALL_STATIONARY_SPEED,
     COLLECTIVE_SPEED_DROP,
+    COLLECTIVE_SPEED_WIDTH,
+    COLLECTIVE_SPEED_SMOOTH_FRAMES,
+    MIN_PLAYERS_FOR_SPEED,
+    DEAD_PROB_WALKING_BALL_UNSEEN,
+    DEAD_PROB_WALKING_BALL_SEEN,
+    DEAD_PROB_ACTIVE_BALL_UNSEEN,
+    DEAD_PROB_ACTIVE_BALL_SEEN,
     OUT_OF_BOUNDS_MARGIN,
-    SET_PIECES_PRIOR_WEIGHT,
-    RESTART_ACCEL_THRESHOLD,
+    SET_PIECE_LEAD_IN_FRAMES,
+    SET_PIECE_LEAD_IN_PROB,
     PITCH_LENGTH,
     PITCH_WIDTH,
-    FPS,
     DEAD_BALL_CODES,
     LOG_FILE
 )
@@ -25,14 +39,28 @@ def log(message):
         f.write(message + '\n')
 
 
-""" Compute per-frame probability that ball is dead (out of play).
+""" Mean speed of the tracked players per frame, smoothed over about a second.
 
-    Signals:
-    - Ball out of bounds (pitch boundaries + margin)
-    - Ball stationary (speed < threshold)
-    - Collective player speed drop (mean < threshold)
-    - Smart Tagging SET PIECES intervals (prior)
-    - Restart detection: ball + players accelerating
+    Frames with too few tracked players (camera cuts, tracking drop-outs) take the last
+    reliable value instead of an average over two or three players.
+
+    Returns:
+        array of speeds in m/s
+"""
+def collective_player_speed(tracking_df):
+    speed_cols = [c for c in tracking_df.columns if c.endswith('_s')]
+    player_speeds = tracking_df[speed_cols].values.astype(float)
+
+    n_tracked = (~np.isnan(player_speeds)).sum(axis=1)
+    with np.errstate(all='ignore'):
+        mean_speed = np.nanmean(player_speeds, axis=1)
+    mean_speed[n_tracked < MIN_PLAYERS_FOR_SPEED] = np.nan
+    mean_speed = pd.Series(mean_speed).ffill().bfill().values
+
+    return gaussian_filter1d(mean_speed, sigma=COLLECTIVE_SPEED_SMOOTH_FRAMES)
+
+
+""" Compute per-frame probability that ball is dead (out of play).
 
     Args:
         tracking_df: DataFrame with tracking data
@@ -46,12 +74,21 @@ def compute_dead_ball_probability(tracking_df, ball_state, events):
     n_frames = len(tracking_df)
     ball_x = ball_state['x']
     ball_y = ball_state['y']
-    ball_speed = ball_state['speed']
+    ball_seen = ball_state['visible']
 
-    dead_prob = np.zeros(n_frames)
+    # Signal 1: are the players walking? 1 = clearly walking, 0 = clearly playing,
+    # with a soft step around COLLECTIVE_SPEED_DROP.
+    mean_speed = collective_player_speed(tracking_df)
+    walking = 1.0 / (1.0 + np.exp((mean_speed - COLLECTIVE_SPEED_DROP) / COLLECTIVE_SPEED_WIDTH))
 
-    # Signal 1: Ball out of bounds
-    out_of_bounds = (
+    # Signal 2: combine with whether the ball is seen.
+    prob_if_walking = np.where(ball_seen, DEAD_PROB_WALKING_BALL_SEEN, DEAD_PROB_WALKING_BALL_UNSEEN)
+    prob_if_active = np.where(ball_seen, DEAD_PROB_ACTIVE_BALL_SEEN, DEAD_PROB_ACTIVE_BALL_UNSEEN)
+    dead_prob = walking * prob_if_walking + (1.0 - walking) * prob_if_active
+
+    # Signal 3a: ball seen beyond the lines. Only where it is actually observed: in a tracking
+    # gap the position is the last sighting, which says nothing about now.
+    out_of_bounds = ball_seen & (
         (ball_x < -OUT_OF_BOUNDS_MARGIN) |
         (ball_x > PITCH_LENGTH + OUT_OF_BOUNDS_MARGIN) |
         (ball_y < -OUT_OF_BOUNDS_MARGIN) |
@@ -59,79 +96,32 @@ def compute_dead_ball_probability(tracking_df, ball_state, events):
     )
     dead_prob[out_of_bounds] = 1.0
 
-    # Signal 2: Ball stationary
-    stationary = ball_speed < BALL_STATIONARY_SPEED
-    dead_prob[stationary] = np.maximum(dead_prob[stationary], 0.6)
-
-    # Signal 3: Collective player speed drop
-    # Get all player speed columns
-    speed_cols = [c for c in tracking_df.columns if c.endswith('_s')]
-
-    if speed_cols:
-        # Compute mean player speed per frame
-        player_speeds = tracking_df[speed_cols].values
-        mean_speed = np.nanmean(player_speeds, axis=1)
-
-        # Smooth to reduce noise
-        mean_speed = gaussian_filter1d(mean_speed, sigma=5.0)
-
-        low_activity = mean_speed < COLLECTIVE_SPEED_DROP
-        dead_prob[low_activity] = np.maximum(dead_prob[low_activity], 0.4)
-
-    # Signal 4: Smart Tagging SET PIECES prior
-    set_pieces_mask = np.zeros(n_frames, dtype=bool)
+    # Signal 3b: Smart Tagging SET PIECES. The tag is a fixed window that starts a few seconds
+    # before the restart and runs on through the live play that follows (35 s for throw-ins,
+    # corners, goal kicks and free kicks). Only its lead-in, before the restart, is dead ball.
+    lead_in = np.zeros(n_frames, dtype=bool)
     for event in events:
         if event['code'] in DEAD_BALL_CODES:
             start = event['start_frame']
-            end = event['end_frame']
+            end = min(start + SET_PIECE_LEAD_IN_FRAMES, event['end_frame'] + 1, n_frames)
             if start < n_frames:
-                end = min(end, n_frames - 1)
-                set_pieces_mask[start:end+1] = True
-
-    # Blend SET PIECES prior with other signals
-    dead_prob[set_pieces_mask] = np.maximum(
-        dead_prob[set_pieces_mask],
-        SET_PIECES_PRIOR_WEIGHT
-    )
-
-    # Signal 5: Restart detection (inverse signal - ball dead UNTIL restart)
-    # Look for sudden acceleration in ball + players after period of low activity
-    if speed_cols:
-        # Compute acceleration
-        ball_accel = np.zeros(n_frames)
-        ball_accel[1:] = np.diff(ball_speed) * FPS  # m/s²
-
-        player_accel = np.zeros(n_frames)
-        for i in range(1, n_frames):
-            player_accel[i] = (mean_speed[i] - mean_speed[i-1]) * FPS
-
-        # Restart = both ball and players accelerate after low activity
-        restart = (
-            (ball_accel > RESTART_ACCEL_THRESHOLD) &
-            (player_accel > RESTART_ACCEL_THRESHOLD * 0.5)
-        )
-
-        # After restart, not dead for next ~3 seconds
-        for i in np.where(restart)[0]:
-            end_live = min(i + int(3 * FPS), n_frames)
-            dead_prob[i:end_live] = np.minimum(dead_prob[i:end_live], 0.2)
+                lead_in[start:end] = True
+    dead_prob[lead_in] = np.maximum(dead_prob[lead_in], SET_PIECE_LEAD_IN_PROB)
 
     # Smooth probabilities to reduce flicker
     dead_prob = gaussian_filter1d(dead_prob, sigma=3.0)
-
-    # Clip to [0, 1]
     dead_prob = np.clip(dead_prob, 0, 1)
 
     # Statistics
     n_dead = (dead_prob > 0.5).sum()
-    n_set_pieces = set_pieces_mask.sum()
+    is_walking = walking > 0.5
 
     log(f"\nDead ball detection:")
     log(f"  Likely dead (prob > 0.5): {n_dead} frames ({100*n_dead/n_frames:.1f}%)")
-    log(f"  Out of bounds: {out_of_bounds.sum()} frames")
-    log(f"  Ball stationary: {stationary.sum()} frames")
-    log(f"  Low collective activity: {low_activity.sum()} frames")
-    log(f"  SET PIECES intervals: {n_set_pieces} frames")
+    log(f"  Players walking, ball unseen: {(is_walking & ~ball_seen).sum()} frames")
+    log(f"  Players walking, ball seen: {(is_walking & ball_seen).sum()} frames")
+    log(f"  Ball seen out of bounds: {out_of_bounds.sum()} frames")
+    log(f"  SET PIECES lead-in: {lead_in.sum()} frames")
     log(f"  Mean dead prob: {dead_prob.mean():.3f}")
 
     return dead_prob
@@ -146,7 +136,7 @@ if __name__ == '__main__':
 
     print("Testing dead ball detection...")
 
-    df, metadata = load_tracking()
+    df, metadata, team_of_track = load_tracking()
     events = load_smart_tagging()
 
     ball_x = df['ball_x'].values

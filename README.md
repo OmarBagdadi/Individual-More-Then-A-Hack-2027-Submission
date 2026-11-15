@@ -20,8 +20,10 @@ python evaluation/validate_submission.py evaluation/results/submission.csv
 python evaluation/run_evaluation.py
 ```
 
-**Expected runtime:** ~2 minutes on modern hardware  
+**Expected runtime:** two to three minutes (measured: 132 to 181 s on a Windows 11 laptop)  
 **Output:** `evaluation/results/submission.csv` (199,319 rows, ~1.9 MB)
+
+A log of every change made since the first version is in [UPDATES.md](UPDATES.md).
 
 ---
 
@@ -31,13 +33,23 @@ Scored on the **public 5-minute window** (17 possessions, 7,500 graded frames):
 
 | Metric | Our Submission | baseline_smooth50 (floor) |
 |--------|----------------|---------------------------|
-| **spellF1** | **0.4706** | 0.2433 (full match) / 0.3256 (public) |
-| **Possessions** | 17 | 26 |
-| **Mean duration** | 17.1s | 10.8s |
-| **Fragmentation** | 1.05 | 1.43 |
-| **Team accuracy** | 90.4% | 85.8% |
+| **spellF1** | **0.5176** | 0.3256 (public) / 0.2433 (full match) |
+| **macroF1** | **0.8284** | 0.6207 |
+| **Possessions** (truth: 17) | 17 | 26 |
+| **Mean duration** (truth: 14.2s) | 15.1s | 10.8s |
+| **Home share of live time** (truth: 57.3%) | 52.4% | 62.1% |
+| **Dead-ball F1** | 0.79 | 0.32 |
+| **Team accuracy** | 89.0% | 85.8% |
 
-The pipeline generates realistic possession counts and durations with minimal fragmentation.
+**How to read this.** The public window is a correctness check, not a leaderboard: one
+possession is worth about 6 points of spellF1 here, and the scorer's own bootstrap reports that
+gaps below ~0.35 are within noise on 17 possessions. Our spellF1 is not distinguishable from
+`baseline_smooth125` (0.4242) on this window; our macroF1 (5-95% range 0.69 to 0.89) is above it. The full-match score is unknown to us.
+
+What we can check without an answer key, over the whole match: 228 possessions with a mean of
+16.4 s (longest 94 s), 99 stoppages, the ball in play for 62 minutes, and the home team with
+60.9% of live time in a match where it made two thirds of the passes. All are in the range of a
+real football match.
 
 ---
 
@@ -45,7 +57,7 @@ The pipeline generates realistic possession counts and durations with minimal fr
 
 ### Requirements
 
-- **Python 3.9+** (tested on 3.9 and 3.12, 3.13 not supported)
+- **Python 3.9 to 3.12** (`run.py` refuses anything newer; verified on 3.12)
 - **Data:** Enrolled participants receive the match data bundle. Unpack to `./data/` or set `MTAH_DATA_DIR`.
 
 ### Installation
@@ -92,7 +104,7 @@ The pipeline is a 6-stage modular system:
 ```
 1. io.py           → Load ATD tracking, Smart Tagging, homography
 2. ball.py         → Reconstruct ball trajectory (interpolate gaps, model uncertainty)
-3. evidence.py     → Compute per-frame control scores (distance-weighted voting)
+3. evidence.py     → Compute per-frame control scores (who is on the ball + Smart Tagging prior)
 4. dead.py         → Detect dead ball periods (multi-signal fusion)
 5. decode.py       → Viterbi decoding with hysteresis and min-duration constraints
 6. weak_eval.py    → Compare with Smart Tagging (sanity check)
@@ -104,13 +116,15 @@ Each module logs diagnostics to `logs/diag.txt`.
 
 1. **Ball reconstruction:** Short gaps (≤1s) interpolated with cubic splines. Long gaps forward-filled with exponentially decaying confidence.
 
-2. **Control evidence:** Players vote with weight `exp(-distance/tau)`. Gated during high ball speed (passes in flight).
+2. **Control evidence:** The closest player of each team is compared: whoever is on the ball (within about a stride) has it, however many opponents press nearby. When nobody is on the ball, or the ball has not been seen for a while, tracking gives no opinion and possession stays with the last team. Smart Tagging possession phases add a mild 60/40 nudge. Gated during high ball speed (passes in flight).
 
-3. **Dead ball detection:** Fuses multiple signals - ball out of bounds, stationary, collective player speed drop, Smart Tagging SET PIECES.
+3. **Dead ball detection:** What the players are doing is the main signal: when play stops they walk. Walking with the ball lost by the tracking is a near-certain stoppage; walking with the ball in view is a mild one. Plus two rules of the game: a ball seen beyond the lines is out, and the 3.5 s before a restart tagged by Smart Tagging are dead (the tag itself is a 35 s window that is mostly live play).
 
-4. **Viterbi decoder:** 3-state (H/A/D) with high H↔A transition cost for hysteresis. Min-duration constraints prevent unrealistic flicker.
+4. **Viterbi decoder:** 3-state (H/A/D) where every change of state carries the same high cost (hysteresis). Min-duration constraints prevent unrealistic flicker. A change of team that falls in a stretch with no evidence is placed in the middle of it.
 
 5. **Restart logic:** Uses Smart Tagging Team tags to assign possession after dead ball periods.
+
+6. **Pre-kick-off:** Graded frames before a half's kick-off are labelled dead (the second half is graded for 2,934 frames before it kicks off).
 
 ---
 
@@ -151,16 +165,26 @@ All hyperparameters are in `src/possession/config.py`:
 BALL_SHORT_GAP_FRAMES = 25          # 1 second at 25 fps
 
 # Control evidence
-CONTROL_DISTANCE_TAU = 3.0          # metres, decay parameter
-CONTROL_MAX_DISTANCE = 10.0         # metres, voting radius
+CONTROL_RADIUS_TAU = 1.0            # metres, a player controls a ball within about a stride
+LOOSE_BALL_DISTANCE = 2.5           # metres, nobody this close = loose ball, no opinion
+CONTROL_SCORE_CAP = 0.85            # a touch is not control (~1 s of clear control to switch)
+PHASE_PRIOR = 0.6                   # Smart Tagging possession phases: mild 60/40 opinion
+
+# Dead ball
+COLLECTIVE_SPEED_DROP = 1.5         # m/s, players walking below this, playing above
+DEAD_PROB_WALKING_BALL_UNSEEN = 0.9 # players walking and the ball lost: stoppage
+DEAD_PROB_WALKING_BALL_SEEN = 0.6   # players walking, ball in view: mild
+SET_PIECE_LEAD_IN_FRAMES = 87       # 3.5 s before a tagged restart are dead
 
 # Viterbi decoding
 TRANSITION_COST_H_A = 40.0          # High cost = sticky possessions
-MIN_POSSESSION_FRAMES = 38          # ~1.5 seconds minimum
+TRANSITION_COST_LIVE_TO_DEAD = 40.0 # Same cost for starting / ending a stoppage
+MIN_POSSESSION_FRAMES = 37          # ~1.5 seconds minimum
+MIN_DEAD_FRAMES = 50                # 2 seconds minimum stoppage
 HYSTERESIS_FRAMES = 25              # ~1.0 second sustained control required
 ```
 
-These were chosen from domain knowledge and prior experience, **not tuned on the public ground truth** (17 possessions is too small for reliable tuning).
+These were chosen from football knowledge and from the plausibility of the full-match output (number of possessions, number and length of stoppages), **not by optimising the score on the public ground truth** (17 possessions is too small for reliable tuning). See [UPDATES.md](UPDATES.md) for the settings that were compared.
 
 ---
 
@@ -186,26 +210,29 @@ Ball reconstruction:
   Long gaps (>25 frames): 143 gaps, 85646 frames
   
 Viterbi decoding:
-  H: 70869 frames (35.6%)
-  A: 69562 frames (34.9%)
-  D: 18426 frames (9.2%)
-  Total possessions: 410
-  Mean possession duration: 13.7 s
+  H: 56766 frames (28.5%)
+  A: 36464 frames (18.3%)
+  D: 65627 frames (32.9%)
+  X: 40462 frames (20.3%)
+  Total possessions: 228
+  Mean possession duration: 16.4 s
 ```
 
 ---
 
 ## Limitations
 
-1. **Dead ball detection is weak:** Low recall on dead ball class (F1 0.06). The system over-predicts live play. This is partially intentional - false negatives on D are less costly than false positives for spellF1.
+1. **Dead ball detection is approximate:** On the public window it finds 69% of dead-ball frames with 92% precision (F1 0.79). Players keep running for two or three seconds after the ball goes out, so stoppages are found a little late, and a quick restart where nobody walks is missed. The full match comes out at 62 minutes of ball in play, at the high end for football.
 
-2. **Tracking errors propagate:** Identity swaps and missing players in the ATD directly affect control evidence. We use collective features to mitigate this.
+2. **Hand-over timing is imprecise:** On the public window we predict 17 possessions against 17 true but find only 5 of 20 change-overs within a second; the misses are early as often as late, and some true possessions are shorter than the 1.5 s minimum. The tracking often does not show the moment the ball changes hands: nobody is clearly on the ball on about half of live frames.
 
-3. **No video features:** The pipeline uses only tracking + Smart Tagging. Video analysis could improve dead ball detection and restart assignment.
+3. **Tracking errors propagate:** Identity swaps and missing players in the ATD directly affect control evidence. Only team membership is used, never player identity.
 
-4. **Smart Tagging dependency:** Restart logic relies on Smart Tagging Team tags, which have N/A values for throw-ins. We fall back to spatial heuristics in these cases.
+4. **No video features:** The pipeline uses only tracking + Smart Tagging. Video analysis could improve dead ball detection and restart assignment.
 
-5. **Hyperparameter sensitivity:** Wide plateaus preferred, but some parameters (e.g., transition costs) have non-obvious interactions.
+5. **Smart Tagging dependency:** Restart logic and the possession prior rely on Smart Tagging Team tags, which are inferred and have N/A values for throw-ins. After a throw-in no restarting team is assigned; the decoder decides from the evidence.
+
+6. **Hyperparameters are not validated against a ground truth:** there is none large enough. They are football judgements checked on the plausibility of the full-match output. The dead-ball probabilities were checked for stability: moving each of them keeps the match between 89 and 101 stoppages.
 
 ---
 

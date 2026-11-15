@@ -37,14 +37,13 @@ def weak_eval(labels, events):
     """
     n_frames = len(labels)
 
-    # Build Smart Tagging team map
+    # Build Smart Tagging team map from the phases that describe a team in possession
+    # (a "DEFENDING ..." phase names the team WITHOUT the ball, so not every tag counts).
+    from src.possession.evidence import phase_prior_sign
+    prior_sign = phase_prior_sign(events, n_frames)
     st_team = np.full(n_frames, '', dtype='U1')
-    for event in events:
-        team_tag = event['tags'].get('Team', 'N/A')
-        if team_tag == SMART_TAGGING_HOME_TEAM:
-            st_team[event['start_frame']:event['end_frame']+1] = 'H'
-        elif team_tag == SMART_TAGGING_AWAY_TEAM:
-            st_team[event['start_frame']:event['end_frame']+1] = 'A'
+    st_team[prior_sign > 0] = 'H'
+    st_team[prior_sign < 0] = 'A'
 
     # Build Smart Tagging SET PIECES map
     st_dead = np.zeros(n_frames, dtype=bool)
@@ -52,8 +51,9 @@ def weak_eval(labels, events):
         if event['code'] in DEAD_BALL_CODES:
             st_dead[event['start_frame']:event['end_frame']+1] = True
 
-    # Compare team labels (where ST has a team tag)
-    tagged_mask = (st_team == 'H') | (st_team == 'A')
+    # Compare team labels where Smart Tagging names a team in possession and we say the
+    # ball is alive (a dead or ungraded frame is neither agreement nor disagreement)
+    tagged_mask = ((st_team == 'H') | (st_team == 'A')) & ((labels == 'H') | (labels == 'A'))
     if tagged_mask.sum() > 0:
         team_agreement = (labels[tagged_mask] == st_team[tagged_mask]).sum() / tagged_mask.sum()
     else:
