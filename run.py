@@ -68,7 +68,7 @@ def main():
     print("\nStage 3: Evidence accumulation...")
     log("\n=== Stage 3: Evidence Accumulation ===")
 
-    evidence = compute_control_evidence(tracking_df, ball_state, metadata, team_of_track)
+    evidence = compute_control_evidence(tracking_df, ball_state, metadata, team_of_track, events)
 
     print(f"  OK - Computed control scores")
 

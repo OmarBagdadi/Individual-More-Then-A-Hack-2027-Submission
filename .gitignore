@@ -56,3 +56,6 @@ evaluation/scoreboard.csv
 
 # Keep baseline results for reference
 !evaluation/results/baseline*.csv
+
+# Local Claude Code settings
+.claude/

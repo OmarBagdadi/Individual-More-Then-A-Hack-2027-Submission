@@ -1,17 +1,19 @@
 # Project Summary - More than a Hack 2027
 
-**Status:** ✅ Complete and working  
-**Date:** November 5, 2026  
-**Deadline:** November 17, 2026 (12 days remaining)
+**Status:** Pipeline runs end to end and the output validates. Not yet submitted.  
+**Updated:** November 12, 2026 (first version: November 5, 2026)  
+**Deadline:** November 17, 2026
+
+Every change since the first version is listed in [UPDATES.md](UPDATES.md).
 
 ---
 
 ## Quick Facts
 
 - **Challenge:** Predict possession labels (H/A/D/X) for 199,319 video frames
-- **Result:** spellF1 **0.4706** on public 5-minute window (beats all baselines)
-- **Possessions:** 17 predicted (exactly matches ground truth count)
-- **Runtime:** ~2 minutes
+- **Public 5-minute window:** spellF1 **0.5176**, macroF1 **0.8284** (a correctness check, not a ranking)
+- **Full match:** score unknown; 228 possessions predicted, mean 16.4 s, home team 60.9% of live time
+- **Runtime:** two to three minutes
 - **Approach:** Interpretable heuristics, no ML training
 
 ---
@@ -21,17 +23,18 @@
 ### Core Pipeline (6 stages)
 1. **io.py** - Data loading and alignment verification
 2. **ball.py** - Ball trajectory reconstruction (handles 41% missing ball)
-3. **evidence.py** - Distance-weighted control evidence from player positions
-4. **dead.py** - Multi-signal dead ball detection
+3. **evidence.py** - Who is on the ball (closest player per team), silence when unknown, Smart Tagging phases as a mild prior
+4. **dead.py** - Dead ball detection: players walking, ball seen or not, out of bounds, the seconds before a tagged restart
 5. **decode.py** - Viterbi decoder with possession structure constraints
 6. **weak_eval.py** - Smart Tagging comparison for sanity checks
 
 ### Documentation
 - **README.md** - Quick start, results, architecture
-- **TECHNICAL.md** - Full technical specification (15 pages)
+- **TECHNICAL.md** - Technical document (the third deliverable)
+- **UPDATES.md** - Change log
 - **requirements.txt** - Pinned dependencies for reproduction
 
-### Output
+### Output (generated, not committed)
 - **evaluation/results/submission.csv** - Main deliverable (199,319 rows)
 - **logs/diag.txt** - Diagnostic log with pipeline statistics
 
@@ -41,176 +44,98 @@
 
 ### Public 5-Minute Window (17 possessions)
 
-| Metric | Value | vs Baseline |
-|--------|-------|-------------|
-| **spellF1** | **0.4706** | +44% over baseline_smooth50 |
-| **Possessions** | 17 | Exact match (GT: 17) |
-| **Mean duration** | 17.1s | Close (GT: 14.2s) |
-| **Fragmentation** | 1.05 | Minimal (GT segments: 21, ours: 22) |
-| **Team accuracy** | 90.4% | Strong |
-| **Transition F1** | 0.2927 | Best of all submissions |
+| Metric | Value | Ground truth / note |
+|--------|-------|---------------------|
+| **spellF1** | **0.5176** | ranking metric |
+| **macroF1** | **0.8284** | tie-break; every baseline is at or below 0.62 |
+| **Possessions** | 17 | 17 |
+| **Mean duration** | 15.1s | 14.2s |
+| **Home share of live time** | 52.4% | 57.3% |
+| **Fragmentation** | 1.10 | 23 predicted segments vs 21 |
+| **Team accuracy** | 89.0% | on frames where both say the ball is alive |
+| **Dead-ball F1** | 0.79 | precision 0.92, recall 0.69 |
+| **Transition F1** | 0.24 | 5 of 20 change-overs found within ±1 s |
 
-### Baseline Comparison
+### Public-window board
 
 ```
-rank  submission                spellF1   poss     dur
-----  ------------------------  -------  -----  ------
-   1  OUR SUBMISSION             0.4706     17    17.1 ✓
-   2  baseline_smooth125         0.4242     16    18.5
-   3  baseline_smooth50          0.3256     26    10.8
-   4  baseline_smooth25          0.2868     36     7.6
-   5  baseline_raw               0.0378    131     2.0
+rank  submission                macroF1  spellF1   poss     dur
+----  ------------------------  -------  -------  -----  ------
+   1  submission                 0.8284   0.5176     17    15.1
+   2  baseline_smooth125         0.5812   0.4242     16    18.5
+   3  baseline_smooth50          0.6207   0.3256     26    10.8
+   4  baseline_smooth25          0.6200   0.2868     36     7.6
+   5  baseline_raw               0.5972   0.0378    131     2.0
 ```
+
+**Read with care.** On 17 possessions the scorer's bootstrap puts spellF1 gaps below ~0.35 inside
+the noise, so first place here proves nothing about the full match. The organisers' own example:
+`baseline_smooth125` beats `baseline_smooth50` on this window and loses to it on the full match.
+
+### Full-match plausibility (no answer key)
+
+| Check | Value | What a real match looks like |
+|-------|-------|------------------------------|
+| Possessions | 228, mean 16.4 s, median 9.7 s, longest 94 s | public truth averages 14.2 s |
+| Stoppages | 99, median 17.8 s | roughly 100-130 restarts |
+| Ball in play | 62 min (41.3% of graded frames dead) | about 55 min in a top-flight match |
+| Home share of live time | 60.9% (64.2% / 57.3% by half) | tracking on clear frames: 61.6% |
+| Frames before 2nd-half kick-off labelled D | 2,934 of 2,934 | all dead (FAQ.md) |
 
 ---
 
 ## Key Design Decisions
 
-1. **High H↔A transition cost** → Sticky possessions (hysteresis)
-2. **Minimum duration constraints** → Prevents flicker
-3. **Distance-weighted voting** → Robust to tracking errors
-4. **Smart Tagging as prior only** → Not hard constraint
-5. **Forward-fill long ball gaps** → Better than Kalman extrapolation
-
----
-
-## What Works Well
-
-✅ **Possession structure:** Matches ground truth count exactly  
-✅ **Temporal coherence:** Low fragmentation (1.05)  
-✅ **Team assignment:** 90% accuracy on alive frames  
-✅ **Robustness:** Handles 41% missing ball gracefully  
-✅ **Speed:** Runs in ~2 minutes  
-✅ **Reproducibility:** Deterministic with pinned dependencies  
+1. **Who is on the ball, not who is near it** → the closest player of each team is compared
+2. **No ball, no opinion** → possession stays with the last team when the ball is loose or unseen
+3. **Every change of state costs the same (40)** → Sticky possessions and sticky stoppages
+4. **Minimum duration constraints** → Prevents flicker
+5. **Smart Tagging as mild prior only** → Not hard constraint
+6. **Dead before kick-off** → Uses the kick-off anchors in `games.py`
+7. **No external statistics used** → public match stats were looked at, never used as a target
 
 ---
 
 ## Known Limitations
 
-⚠️ **Dead ball detection weak** (F1 0.06)
-- Over-predicts live play
-- Intentional tradeoff for spellF1 optimization
-
-⚠️ **No video features** 
-- Could improve with referee signals, boundary detection
-
-⚠️ **Smart Tagging Team = N/A for throw-ins**
-- Falls back to spatial heuristics
-
----
-
-## Files Changed
-
-### New Files
-```
-run.py                          # Main entry point
-src/possession/
-  ├── __init__.py
-  ├── config.py                 # All hyperparameters
-  ├── io.py                     # Data loading
-  ├── ball.py                   # Ball reconstruction
-  ├── evidence.py               # Control evidence
-  ├── dead.py                   # Dead ball detection
-  ├── decode.py                 # Viterbi decoder
-  ├── weak_eval.py              # Smart Tagging comparison
-  └── submission.py             # CSV writer
-TECHNICAL.md                    # Technical specification
-logs/diag.txt                   # Diagnostic log
-evaluation/results/submission.csv  # Output
-```
-
-### Modified Files
-```
-README.md                       # Complete rewrite
-requirements.txt                # Pinned versions
-.gitignore                      # Updated
-```
+- **Hand-over timing is imprecise.** On the public window we predict 17 possessions against 17
+  but find only 5 of 20 change-overs within a second, early as often as late.
+- **Dead ball detection is approximate** (F1 0.79 on the public window). Stoppages are found two
+  or three seconds late and quick restarts are missed; 62 minutes of ball in play is at the high
+  end for a football match.
+- **No video features.**
+- **Smart Tagging Team = N/A for throw-ins**, so the restarting team is not known there.
+- **Hyperparameters are not validated against a ground truth**; there is none large enough.
 
 ---
 
 ## Testing Checklist
 
-- [x] Pipeline runs end-to-end
+- [x] Pipeline runs end-to-end (Python 3.12, Windows 11)
 - [x] Submission validates (format check passes)
-- [x] Scores on public GT (ranks #1, spellF1 0.4706)
-- [x] Possession count realistic (17 vs GT 17)
-- [x] Duration distribution reasonable (mean 17.1s vs GT 14.2s)
-- [x] Reproducible (deterministic with fixed seed)
-- [x] Documentation complete (README + TECHNICAL)
+- [x] Two consecutive runs produce byte-identical files
+- [x] Scores on public GT as a correctness check
+- [x] Full-match possession, stoppage and ball-in-play numbers plausible
+- [x] Documentation matches the code (README + TECHNICAL)
 - [x] Dependencies pinned (requirements.txt)
+- [ ] Clean-checkout test on a second machine
 
 ---
 
-## Submission Ready
+## Before Submitting
 
-### Three Deliverables
-
-1. ✅ **Possession file:** `evaluation/results/submission.csv`
-   - 199,319 rows, format validated
-   - Generates realistic possessions
-
-2. ✅ **Code repository:** Current directory
-   - Complete source in `src/possession/`
-   - Executable: `python run.py`
-   - Deterministically regenerates submission.csv
-
-3. ✅ **Technical document:** `TECHNICAL.md`
-   - 15 pages covering approach, assets, rules, limitations
-   - Also: README.md for quick reference
-
-### Before Submitting
-
-- [ ] Push to public GitHub repository
-- [ ] Verify data/ is excluded (.gitignore)
-- [ ] Test on clean checkout
-- [ ] Export TECHNICAL.md to PDF (optional, markdown accepted)
-- [ ] Fill out Google Form with team name
-
----
-
-## Next Steps (If Time Permits)
-
-### Quick Wins (< 1 day)
-1. **Tune transition costs** - Sweep 30-50 range for H↔A cost
-2. **Adjust dead ball threshold** - Currently over-predicts live play
-3. **Bootstrap confidence intervals** - Run `--bootstrap 1000` on public GT
-
-### Medium Effort (2-3 days)
-1. **Improve restart logic** - Better inference for throw-in N/A cases
-2. **Add player formation features** - Detect defensive vs attacking shape
-3. **Speed optimization** - Vectorize evidence loop, ~10x faster
-
-### Research (1 week+)
-1. **Broadcast video alignment** - Solve synchronization problem
-2. **Video-based dead ball detection** - Referee pose classifier
-3. **Learned model** - Train on synthetic data or augmented GT
-
----
-
-## Production Readiness
-
-**Current state:** Research prototype → Submission-ready  
-**What it does well:** Core possession detection with structure  
-**What it doesn't:** Video features, real-time inference, multi-match generalization  
-
-**To productionize:**
-- Add video-based features (referee, boundaries)
-- Train model on multiple matches
-- Optimize for real-time (< 1s per frame)
-- Add confidence intervals per prediction
-- Build API for live-match inference
+- [ ] Agree the changes in UPDATES.md with the repository owner, commit and push
+- [ ] Confirm `data/` and the submission CSV are not in the public repository
+- [ ] Re-run `python run.py`, then rename the output to `<team_name>.csv`
+- [ ] Run `python evaluation/validate_submission.py <team_name>.csv` on that exact file
+- [ ] Save the technical document as `<team_name>.pdf` or `<team_name>.md`
+- [ ] Add a `LICENSE` file or remove the licence line from README.md
+- [ ] Fill out the Google Form (one response per team) with the registered team name
 
 ---
 
 ## Contact
 
-- **Repository:** (to be made public for submission)
-- **Documentation:** README.md, TECHNICAL.md
+- **Documentation:** README.md, TECHNICAL.md, UPDATES.md
 - **Logs:** logs/diag.txt
 - **Competition:** https://landing.mobileworldcapital.com/more-than-a-hack-2027
-
----
-
-**Generated:** November 5, 2026  
-**Pipeline version:** 1.0  
-**Ready for submission:** Yes ✅
